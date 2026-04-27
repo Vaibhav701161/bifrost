@@ -2179,6 +2179,19 @@ func EnsureStreamFinalizerCalled(ctx context.Context, finalizer func(context.Con
 // via channels, atomics, and sync.Once. Race testing for this package is
 // therefore scoped to providers/utils/... where it passes cleanly.
 //
+// Goroutine bookkeeping (counters in streamtimeout_observability.go):
+//   - activeStreamCancellationGoroutines: in-flight ctx watchers
+//   - activeStreamReadGoroutines:        in-flight inner Read goroutines
+//   - hard cap (BIFROST_MAX_STREAM_TIMEOUT_GOROUTINES, default 4096)
+//     enforced via TryAcquireStreamTimeoutSlot. New ctx-watcher goroutines
+//     are REFUSED past the cap; the stream proceeds without ctx-cancellation
+//     enforcement (idle/total timers still apply since they are timer-based,
+//     not goroutine-based at admission). Rejection emits a structured
+//     stream.timeout.admission_rejected event.
+// Every fire path emits a structured stream.timeout.fired event with
+// reason (idle|total|ctx_cancel), configured_ms, elapsed_ms, close_invoked,
+// close_result, and termination_guarantee. There are no silent-failure paths.
+//
 // =============================================================================
 
 // StreamCloseFunc closes the upstream response body. Stream-timeout helpers
@@ -2217,15 +2230,28 @@ func SetupStreamCancellation(ctx context.Context, closeFn StreamCloseFunc, logge
 	done := make(chan struct{})
 	closed := make(chan struct{})
 	var fired sync.Once
+	startedAt := time.Now()
 
+	// HARD CAP: refuse to spawn the watcher goroutine if we are at capacity.
+	// Caller proceeds without context-cancellation enforcement; the idle/total
+	// timers still apply (they are timer-based, not goroutine-based at admission
+	// time). This is graceful degradation, not silent: TryAcquireStreamTimeoutSlot
+	// emits a structured admission_rejected event.
+	if err := TryAcquireStreamTimeoutSlot(); err != nil {
+		close(closed)
+		return func() { close(done); <-closed }
+	}
 	go func() {
+		defer noteStreamCancellationStopped()
 		defer close(closed)
 		invoke := func() {
 			fired.Do(func() {
 				if closeFn == nil {
+					emitStreamTimeoutEvent(streamTimeoutReasonCtxCancel, 0, time.Since(startedAt), true, nil)
 					return
 				}
-				_ = closeFn()
+				err := closeFn()
+				emitStreamTimeoutEvent(streamTimeoutReasonCtxCancel, 0, time.Since(startedAt), false, err)
 			})
 		}
 		select {
@@ -2359,6 +2385,7 @@ func NewTotalTimeoutReader(reader io.Reader, closeFn StreamCloseFunc, totalTimeo
 		reader:  reader,
 		closeFn: closeFn,
 	}
+	startedAt := time.Now()
 	r.timer = time.AfterFunc(totalTimeout, func() {
 		r.closeOnce.Do(func() {
 			r.capFired.Store(true)
@@ -2369,9 +2396,11 @@ func NewTotalTimeoutReader(reader io.Reader, closeFn StreamCloseFunc, totalTimeo
 				cancellable.cancelStream(ErrStreamTotalTimeout)
 			}
 			if r.closeFn == nil {
+				emitStreamTimeoutEvent(streamTimeoutReasonTotal, totalTimeout, time.Since(startedAt), true, nil)
 				return
 			}
-			_ = r.closeFn()
+			err := r.closeFn()
+			emitStreamTimeoutEvent(streamTimeoutReasonTotal, totalTimeout, time.Since(startedAt), false, err)
 		})
 	})
 	cleanup := func() {
@@ -2563,9 +2592,11 @@ func NewIdleTimeoutReader(reader io.Reader, closeFn StreamCloseFunc, timeout tim
 			r.firedErr.Store(error(ErrStreamIdleTimeout))
 			close(r.fired)
 			if r.closeFn == nil {
+				emitStreamTimeoutEvent(streamTimeoutReasonIdle, timeout, time.Since(r.startedAt), true, nil)
 				return
 			}
-			_ = r.closeFn()
+			err := r.closeFn()
+			emitStreamTimeoutEvent(streamTimeoutReasonIdle, timeout, time.Since(r.startedAt), false, err)
 		})
 	})
 	return r, func() {
@@ -2608,7 +2639,9 @@ func (r *idleTimeoutReader) Read(p []byte) (int, error) {
 	}
 
 	ch := make(chan readResult, 1)
+	noteStreamReadStarted()
 	go func(scratch []byte, releasedScratch bool) {
+		defer noteStreamReadStopped()
 		// Recover panics from the underlying reader. fasthttp's requestStream
 		// panics with a nil bufio.Reader if it is read AFTER CloseBodyStream
 		// has been called (use-after-release of pooled state). Treat any panic
